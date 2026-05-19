@@ -357,12 +357,12 @@ Use environment variables for the first version:
 - [x] Implement `GET /calls/:call_id`.
 - [x] Add basic unit tests for call lifecycle and transcript append behavior.
 
-### Phase 3: SSE Event Stream
+### Phase 3: SSE Event Stream (Completed)
 
-- Implement per-call event bus.
-- Implement call event publishing for ordered `transcript` and `suggestion` events.
-- Implement `GET /calls/:call_id/stream` using SSE.
-- Add a small manual test client or documented `curl` workflow.
+- [x] Implement per-call event bus.
+- [x] Implement call event publishing for ordered `transcript` and `suggestion` events.
+- [x] Implement `GET /calls/:call_id/stream` using SSE.
+- [x] Add a small manual test client or documented `curl` workflow.
 
 ### Phase 4: Telnyx Webhook And Media Stream
 

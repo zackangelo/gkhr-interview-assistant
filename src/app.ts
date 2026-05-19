@@ -1,10 +1,13 @@
 import { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
 import type { AppConfig } from "./config.js";
 import type { CallStore } from "./domain/call-store.js";
 import type { Call, Suggestion, TranscriptSegment } from "./domain/types.js";
+import type { CallEventBus } from "./events/call-event-bus.js";
+import { InMemoryCallEventBus } from "./events/call-event-bus.js";
 import { InMemoryCallStore } from "./store/in-memory-call-store.js";
 
 interface WebhookPing {
@@ -21,6 +24,7 @@ const maxWebhookPings = 20;
 
 interface AppDependencies {
   callStore?: CallStore;
+  eventBus?: CallEventBus;
 }
 
 const createCallSchema = z.object({
@@ -34,6 +38,7 @@ export function createApp(
 ): Hono {
   const app = new Hono();
   const callStore = dependencies.callStore ?? new InMemoryCallStore();
+  const eventBus = dependencies.eventBus ?? new InMemoryCallEventBus();
   const webhookPings: WebhookPing[] = [];
 
   app.get("/", (c) => {
@@ -138,6 +143,42 @@ export function createApp(
             }
           : null,
       },
+    });
+  });
+
+  app.get("/calls/:call_id/stream", async (c) => {
+    const callId = c.req.param("call_id");
+    const call = await callStore.getCall(callId);
+    if (!call) {
+      return c.json(
+        {
+          error: {
+            code: "not_found",
+            message: `Call not found: ${callId}`,
+          },
+        },
+        404,
+      );
+    }
+
+    const subscription = eventBus.subscribe(callId);
+
+    return streamSSE(c, async (stream) => {
+      stream.onAbort(() => {
+        subscription.close();
+      });
+
+      for await (const event of subscription) {
+        if (stream.aborted) {
+          break;
+        }
+
+        await stream.writeSSE({
+          event: event.type,
+          id: event.id,
+          data: JSON.stringify(event),
+        });
+      }
     });
   });
 

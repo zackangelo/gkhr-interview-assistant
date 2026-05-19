@@ -17,6 +17,25 @@ Set `TELNYX_DIAL_IN_NUMBER` before using `POST /calls`:
 TELNYX_DIAL_IN_NUMBER=+15122548727 npm run dev
 ```
 
+Create a pending call:
+
+```sh
+curl -sS http://localhost:3000/calls \
+  -H 'content-type: application/json' \
+  -d '{"contextPrompt":"Candidate: Jane Candidate\nRole: Senior Backend Engineer","conferenceName":"interview-int_789"}'
+```
+
+Open the live call event stream:
+
+```sh
+curl -N http://localhost:3000/calls/{call_id}/stream
+```
+
+The stream emits ordered `transcript` and `suggestion` Server-Sent Events.
+Transcript and suggestion events are published by the internal call event bus;
+Telnyx, Deepgram, and Mixlayer integrations will feed this stream in later
+phases.
+
 ## Local Telnyx Webhook Testing With Tailscale Funnel
 
 Telnyx needs a publicly reachable webhook URL. For local development, use

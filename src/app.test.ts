@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
+import { InMemoryCallEventBus } from "./events/call-event-bus.js";
 
 describe("app", () => {
   const testConfig = loadConfig({
@@ -149,6 +150,69 @@ describe("app", () => {
     const app = createApp(testConfig);
 
     const response = await app.request("/calls/unknown-call");
+
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toMatchObject({
+      error: {
+        code: "not_found",
+      },
+    });
+  });
+
+  it("streams published call events over SSE", async () => {
+    const eventBus = new InMemoryCallEventBus({
+      createId: () => "event_123",
+      now: () => new Date("2026-05-19T12:00:00.000Z"),
+    });
+    const app = createApp(testConfig, { eventBus });
+
+    const createResponse = await app.request("/calls", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        contextPrompt: "Candidate: Jane Candidate",
+      }),
+    });
+    const createBody = await createResponse.json();
+    const streamResponse = await app.request(
+      `/calls/${createBody.call.id}/stream`,
+    );
+    const reader = streamResponse.body?.getReader();
+    expect(reader).toBeDefined();
+
+    eventBus.publishTranscript({
+      id: "seg_123",
+      callId: createBody.call.id,
+      speaker: "speaker_0",
+      role: "unknown",
+      text: "Hello there",
+      isFinal: true,
+      startedAtMs: 0,
+      endedAtMs: 1000,
+      confidence: 0.95,
+      createdAt: new Date("2026-05-19T12:00:00.000Z"),
+    });
+
+    const chunk = await reader?.read();
+    await reader?.cancel();
+    const frame = new TextDecoder().decode(chunk?.value);
+
+    expect(streamResponse.status).toBe(200);
+    expect(streamResponse.headers.get("content-type")).toContain(
+      "text/event-stream",
+    );
+    expect(frame).toContain("event: transcript");
+    expect(frame).toContain("id: event_123");
+    expect(frame).toContain('"segmentId":"seg_123"');
+    expect(frame).toContain('"sequence":1');
+  });
+
+  it("returns 404 for unknown call streams", async () => {
+    const app = createApp(testConfig);
+
+    const response = await app.request("/calls/unknown-call/stream");
 
     expect(response.status).toBe(404);
     await expect(response.json()).resolves.toMatchObject({

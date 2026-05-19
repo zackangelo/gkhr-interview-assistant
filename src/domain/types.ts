@@ -15,7 +15,8 @@ export type SpeakerRole = "interviewer" | "candidate" | "unknown";
 
 export interface CreateCallInput {
   contextPrompt: string;
-  conferenceName?: string;
+  dialInNumber: string;
+  conferenceName: string;
 }
 
 export interface Call {

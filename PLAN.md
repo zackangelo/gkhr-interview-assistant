@@ -53,16 +53,18 @@ The in-memory datastore should be intentionally shaped like a future Postgres-ba
 2. The server creates a pending internal call record using the supplied context prompt and returns dial-in instructions using a provisioned Telnyx number.
 3. Interview participants call the Telnyx number, and Telnyx sends a webhook to `POST /answerCall`.
 4. The server validates the webhook, extracts Telnyx call identifiers, and attaches the provider call leg to the pending call record.
-5. The server answers the call leg and creates or joins the Telnyx conference bridge.
-6. The server starts Telnyx media streaming on the selected call leg.
-7. Telnyx connects to our WebSocket media endpoint and sends audio events.
-8. The media handler normalizes the audio payload and forwards it to Deepgram.
-9. Deepgram emits interim and final transcript results.
-10. The transcript service stores diarized transcript segments with provider speaker labels and optional best-effort roles.
-11. Final transcript segments are stored and broadcast to UI subscribers.
-12. The suggestion engine runs periodically and when meaningful transcript segments accumulate.
-13. Mixlayer returns structured suggestions, which are stored and broadcast to UI subscribers.
-14. When the call ends, the server closes provider streams, marks the call completed, and optionally generates a final summary.
+5. For `call.initiated`, the server answers the call leg through `POST /v2/calls/:call_control_id/actions/answer`.
+6. After `call.answered`, the server creates the Telnyx conference bridge from that answered leg through `POST /v2/conferences`.
+7. Later participant legs are answered and joined to the existing bridge through `POST /v2/conferences/:conference_id/actions/join`.
+8. The server starts Telnyx media streaming on the selected call leg.
+9. Telnyx connects to our WebSocket media endpoint and sends audio events.
+10. The media handler normalizes the audio payload and forwards it to Deepgram.
+11. Deepgram emits interim and final transcript results.
+12. The transcript service stores diarized transcript segments with provider speaker labels and optional best-effort roles.
+13. Final transcript segments are stored and broadcast to UI subscribers.
+14. The suggestion engine runs periodically and when meaningful transcript segments accumulate.
+15. Mixlayer returns structured suggestions, which are stored and broadcast to UI subscribers.
+16. When the call ends, the server closes provider streams, marks the call completed, and optionally generates a final summary.
 
 ## API Shape
 
@@ -330,6 +332,7 @@ Use environment variables for the first version:
 - `PUBLIC_BASE_URL`
 - `TELNYX_API_KEY`
 - `TELNYX_CONNECTION_ID`
+- `TELNYX_DIAL_IN_NUMBER`
 - `TELNYX_WEBHOOK_PUBLIC_KEY` or equivalent signature validation config
 - `DEEPGRAM_API_KEY`
 - `DEEPGRAM_MODEL`
@@ -339,20 +342,20 @@ Use environment variables for the first version:
 
 ## Implementation Phases
 
-### Phase 1: Project Skeleton
+### Phase 1: Project Skeleton (Completed)
 
-- Initialize TypeScript, Hono, linting/formatting, and test tooling.
-- Add configuration loading and validation.
-- Add basic health endpoint.
-- Define core domain types and datastore interface.
+- [x] Initialize TypeScript, Hono, formatting, and test tooling.
+- [x] Add configuration loading and validation.
+- [x] Add basic health endpoint.
+- [x] Define core domain types and datastore interface.
 
-### Phase 2: Call API And Store
+### Phase 2: Call API And Store (Completed)
 
-- Implement in-memory `CallStore`.
-- Implement `POST /calls` to create pending assistant sessions and return dial-in instructions.
-- Implement `GET /calls`.
-- Implement `GET /calls/:call_id`.
-- Add basic unit tests for call lifecycle and transcript append behavior.
+- [x] Implement in-memory `CallStore`.
+- [x] Implement `POST /calls` to create pending assistant sessions and return dial-in instructions.
+- [x] Implement `GET /calls`.
+- [x] Implement `GET /calls/:call_id`.
+- [x] Add basic unit tests for call lifecycle and transcript append behavior.
 
 ### Phase 3: SSE Event Stream
 
@@ -425,6 +428,7 @@ Use environment variables for the first version:
 
 Telnyx supports creating and joining conferences through Voice API conference commands.
 
+- `POST /v2/calls/:call_control_id/actions/answer` answers an inbound Call Control leg. This is required before the caller stops hearing ringback.
 - `POST /v2/conferences` creates a conference from an existing call leg using `call_control_id` and automatically bridges that call leg into the conference.
 - `POST /v2/conferences/:id/actions/join` joins another existing call leg into the conference.
 - The join command accepts `client_state`, `command_id`, `hold`, `mute`, `start_conference_on_enter`, `end_conference_on_exit`, and `supervisor_role`.
@@ -435,10 +439,27 @@ Implications:
 
 - `POST /calls` in our API can create a pending assistant session and return a configured Telnyx dial-in number.
 - The live Telnyx conference bridge cannot be fully created until at least one call leg exists, because Telnyx `POST /v2/conferences` requires `call_control_id`.
-- When the first participant calls in, `/answerCall` should answer the leg and create the Telnyx conference from that leg.
-- Later participant legs can be joined with `POST /v2/conferences/:id/actions/join`.
+- When the first participant calls in, `/answerCall` should answer the leg. After the `call.answered` webhook arrives, create the Telnyx conference from that leg.
+- Later participant legs should also be answered first, then joined with `POST /v2/conferences/:id/actions/join`.
 - If the existing interview already runs through Telnyx Call Control, attach media streaming to the relevant call leg and avoid adding a new audible participant.
 - If the product requirement requires the assistant to be a conference participant, join an assistant-controlled call leg to the conference as `supervisor_role: "monitor"` and stream media from that leg.
+
+Confirmed first-leg API sequence:
+
+1. Receive `call.initiated` with `payload.state: "parked"`.
+2. Send `POST /v2/calls/:call_control_id/actions/answer`.
+3. Receive `call.answered`.
+4. Send `POST /v2/conferences` with the answered leg's `call_control_id` and the internal `conferenceName`.
+5. Receive `conference.created` and `conference.participant.joined`.
+6. Store the returned `conference_id` on the internal call.
+
+Confirmed later-leg API sequence:
+
+1. Receive another `call.initiated`.
+2. Send `POST /v2/calls/:call_control_id/actions/answer`.
+3. Receive `call.answered`.
+4. Resolve the existing internal call and stored Telnyx `conference_id`.
+5. Send `POST /v2/conferences/:conference_id/actions/join` with the new leg's `call_control_id`.
 
 ### Media Streaming And Tracks
 
@@ -474,6 +495,97 @@ Conference APIs and webhooks provide useful correlation metadata:
 
 These fields are useful for call lifecycle tracking and participant correlation, but the docs reviewed do not establish a reliable mapping from media frames to individual conference participants.
 
+### Observed Telnyx Webhook Payloads
+
+Observed through the local `/answerCall` webhook behind Tailscale Funnel on May 19, 2026.
+
+Inbound `call.initiated` example:
+
+```json
+{
+  "data": {
+    "event_type": "call.initiated",
+    "id": "9f9301c2-a9db-41bf-a670-013af4c67e3a",
+    "occurred_at": "2026-05-19T23:30:15.038431Z",
+    "payload": {
+      "call_control_id": "v3:CM8u1zCcmtZ3Jzb6vuXBSzCLS5p7ww8ypCUpyBJVrubAVjjLAAECYg",
+      "call_leg_id": "b0457f28-53da-11f1-9961-02420aef271f",
+      "call_session_id": "b04574f6-53da-11f1-8e4b-02420aef271f",
+      "caller_id_name": "+15129342627",
+      "calling_party_type": "pstn",
+      "client_state": null,
+      "connection_codecs": "PCMU,PCMA,G729",
+      "connection_id": "2963572552552678752",
+      "direction": "incoming",
+      "from": "+15129342627",
+      "from_sip_uri": "+15129342627@206.147.72.186:5060",
+      "offered_codecs": "AMR-WB~OCTET-ALIGN=0; MODE-SET=0,16000H,AMR-WB~OCTET-ALIGN=1; MODE-SET=0,16000H,PCMU,G729",
+      "start_time": "2026-05-19T23:30:15.038431Z",
+      "state": "parked",
+      "to": "+15122548727",
+      "to_sip_uri": "+15122548727@us.icp.telnyx.com:5060"
+    },
+    "record_type": "event"
+  },
+  "meta": {
+    "attempt": 1,
+    "delivered_to": "https://zack-macbook-2024.tailbfe4ed.ts.net/answerCall"
+  }
+}
+```
+
+Observed headers included:
+
+```json
+{
+  "content-type": "application/json",
+  "telnyx-signature-ed25519": "...",
+  "telnyx-timestamp": "1779233415",
+  "user-agent": "telnyx-webhooks",
+  "x-forwarded-host": "zack-macbook-2024.tailbfe4ed.ts.net",
+  "x-forwarded-proto": "https"
+}
+```
+
+Because the app did not yet answer the call, the caller hung up and Telnyx sent `call.hangup`:
+
+```json
+{
+  "data": {
+    "event_type": "call.hangup",
+    "id": "08464bf3-4e98-41f5-b526-09e9b04a66c7",
+    "occurred_at": "2026-05-19T23:30:23.738431Z",
+    "payload": {
+      "call_control_id": "v3:CM8u1zCcmtZ3Jzb6vuXBSzCLS5p7ww8ypCUpyBJVrubAVjjLAAECYg",
+      "call_leg_id": "b0457f28-53da-11f1-9961-02420aef271f",
+      "call_session_id": "b04574f6-53da-11f1-8e4b-02420aef271f",
+      "connection_id": "2963572552552678752",
+      "end_time": "2026-05-19T23:30:23.738431Z",
+      "from": "+15129342627",
+      "hangup_cause": "originator_cancel",
+      "hangup_source": "caller",
+      "sip_hangup_cause": "487",
+      "start_time": "2026-05-19T23:30:15.038431Z",
+      "telnyx_error": null,
+      "to": "+15122548727"
+    },
+    "record_type": "event"
+  },
+  "meta": {
+    "attempt": 1,
+    "delivered_to": "https://zack-macbook-2024.tailbfe4ed.ts.net/answerCall"
+  }
+}
+```
+
+Implementation implications:
+
+- `call.initiated` arrives with `payload.state: "parked"` for inbound calls.
+- Ringback continues until the server sends the Answer command.
+- Store `data.id` for webhook idempotency.
+- Store `payload.call_control_id`, `payload.call_leg_id`, `payload.call_session_id`, `payload.connection_id`, `payload.from`, and `payload.to`.
+- Preserve Telnyx signature headers for verification tests, but do not store full request headers in production.
+
 ### Webhook And Command Reliability
 
 Telnyx command and webhook behavior reinforces the datastore design:
@@ -488,6 +600,7 @@ Implementation should persist processed webhook IDs, command IDs, provider IDs, 
 Telnyx docs used:
 
 - https://developers.telnyx.com/docs/voice/programmable-voice/media-streaming
+- https://developers.telnyx.com/api-reference/call-commands/answer-call
 - https://developers.telnyx.com/api-reference/call-commands/streaming-start
 - https://developers.telnyx.com/api-reference/conference-commands/create-conference
 - https://developers.telnyx.com/api-reference/conference-commands/join-a-conference
@@ -505,7 +618,7 @@ Telnyx docs used:
 
 Research and implementation preparation before writing production integration code:
 
-1. Run a Telnyx sandbox/manual call test for the target conference topology and capture real webhook plus media WebSocket fixtures.
+1. Implement Answer command handling for observed inbound `call.initiated` events.
 2. Decide the routing mechanism from inbound Telnyx webhook to pending internal call: unique dial-in number, conference code, expected caller number, or provider metadata.
 3. Decide whether the first implementation streams an existing interview call leg or joins an assistant call leg as `supervisor_role: "monitor"`.
 4. Decide completed-call retention behavior for the in-memory prototype.

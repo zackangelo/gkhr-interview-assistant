@@ -1,0 +1,512 @@
+# Interview Assistant Voice Agent Plan
+
+## Goal
+
+Build a Node.js TypeScript server using Hono that can join a live interview call through Telnyx, transcribe the call with Deepgram, generate interviewer coaching suggestions with Mixlayer's OpenAI-compatible chat completions API, and expose call state plus live updates to a browser UI.
+
+The server is an interviewer-side assistant. It should not speak into the call at first. Its primary output is a real-time web UI stream containing:
+
+- diarized transcript segments from the live conversation
+- agent suggestions inserted into the same timeline
+
+## Current External API Assumptions
+
+- Telnyx Call Control can answer calls and start media streaming to our WebSocket server.
+- Telnyx media streaming should be treated as the ingress audio transport from the conference call into our app.
+- Deepgram streaming transcription supports diarization. We should still design defensively because diarization quality and channel separation may vary by call setup.
+- Mixlayer exposes an OpenAI-compatible REST API at a `/v1/chat/completions` style endpoint, so we can start with a small provider wrapper instead of the Modelsocket SDK.
+
+Provider docs checked while writing this plan:
+
+- Telnyx media streaming: https://developers.telnyx.com/docs/voice/programmable-voice/media-streaming
+- Deepgram diarization: https://developers.deepgram.com/docs/diarization
+- Deepgram streaming feature overview: https://developers.deepgram.com/docs/stt-streaming-feature-overview
+- Mixlayer docs: https://docs.mixlayer.com/
+
+## Non-Goals For The First Version
+
+- No voice response or audio injection back into the call.
+- No production database requirement at first; use an in-memory datastore with an interface that can be replaced.
+- No full authentication system for the initial local prototype, though webhook signature verification and UI auth should be planned before production.
+- No ATS/context retrieval integration inside this service initially. The caller of `POST /calls` provides the full LLM context prompt.
+- No custom diarization model. Use Deepgram diarization and call metadata first, then evaluate improvements.
+
+## Proposed Architecture
+
+The first implementation should be a single Hono server with a small set of internal services:
+
+- `CallStore`: tracks active and completed calls, transcripts, summaries, connected UI streams, and lifecycle state.
+- `TelnyxService`: handles incoming webhooks, answers calls, starts media streaming, and maps Telnyx call identifiers to internal call records.
+- `MediaStreamHandler`: accepts Telnyx WebSocket media events and forwards audio frames into the transcription pipeline.
+- `DeepgramTranscriber`: owns the Deepgram streaming WebSocket connection and emits normalized transcript segments.
+- `TranscriptService`: assembles transcript segments into a durable ordered transcript with speaker labels, timestamps, confidence, and final/interim state.
+- `SuggestionEngine`: periodically calls Mixlayer with call context and transcript deltas, then emits structured suggestions.
+- `EventBus`: publishes normalized call events to SSE clients.
+
+Keep the boundaries explicit even if the first version lives in a few files. This keeps the prototype easy to split later.
+
+The in-memory datastore should be intentionally shaped like a future Postgres-backed repository. Avoid APIs that depend on object identity, in-process timers as the only source of truth, or direct mutation of stored records. Prefer explicit repository methods, serializable records, stable IDs, and append-style event writes where practical.
+
+## Runtime Flow
+
+1. The client calls `POST /calls` to create an interview assistant session.
+2. The server creates a pending internal call record using the supplied context prompt and returns dial-in instructions using a provisioned Telnyx number.
+3. Interview participants call the Telnyx number, and Telnyx sends a webhook to `POST /answerCall`.
+4. The server validates the webhook, extracts Telnyx call identifiers, and attaches the provider call leg to the pending call record.
+5. The server answers the call leg and creates or joins the Telnyx conference bridge.
+6. The server starts Telnyx media streaming on the selected call leg.
+7. Telnyx connects to our WebSocket media endpoint and sends audio events.
+8. The media handler normalizes the audio payload and forwards it to Deepgram.
+9. Deepgram emits interim and final transcript results.
+10. The transcript service stores diarized transcript segments with provider speaker labels and optional best-effort roles.
+11. Final transcript segments are stored and broadcast to UI subscribers.
+12. The suggestion engine runs periodically and when meaningful transcript segments accumulate.
+13. Mixlayer returns structured suggestions, which are stored and broadcast to UI subscribers.
+14. When the call ends, the server closes provider streams, marks the call completed, and optionally generates a final summary.
+
+## API Shape
+
+### `POST /calls`
+
+Creates a new pending interview assistant session and returns dial-in instructions.
+
+This endpoint is the app-level source of truth. It should not assume a Telnyx conference already exists, because Telnyx conference creation requires an existing call leg. Instead, it creates an internal pending call record that later Telnyx webhooks attach real call legs to.
+
+Initial request shape:
+
+```json
+{
+  "contextPrompt": "Candidate: Jane Candidate\nRole: Senior Backend Engineer\nInterview focus: distributed systems, API design, and migration leadership.\nRelevant resume notes: ...",
+  "conferenceName": "interview-int_789"
+}
+```
+
+Initial response shape:
+
+```json
+{
+  "call": {
+    "id": "call_123",
+    "status": "pending",
+    "dialInNumber": "+12025550131",
+    "conferenceName": "interview-int_789",
+    "streamUrl": "/calls/call_123/stream"
+  }
+}
+```
+
+Implementation notes:
+
+- `dialInNumber` is a configured/provisioned Telnyx number, not a newly purchased number.
+- `conferenceName` should be unique or otherwise safely mapped to the internal call ID.
+- If multiple pending calls can share the same dial-in number, the system needs a routing mechanism such as a conference code, expected caller numbers, or metadata in the `POST /calls` payload.
+- Store `contextPrompt` immediately, so LLM context is ready before the first transcript segment arrives.
+
+### `GET /calls`
+
+Returns calls currently in progress.
+
+Initial response shape:
+
+```json
+{
+  "calls": [
+    {
+      "id": "call_123",
+      "provider": "telnyx",
+      "providerCallId": "telnyx_call_control_id",
+      "status": "pending",
+      "dialInNumber": "+12025550131",
+      "conferenceName": "interview-int_789",
+      "startedAt": "2026-05-19T12:00:00.000Z",
+      "contextPreview": "Candidate: Jane Candidate; Role: Senior Backend Engineer",
+      "lastActivityAt": "2026-05-19T12:02:00.000Z"
+    }
+  ]
+}
+```
+
+### `GET /calls/:call_id`
+
+Returns one call, including transcript and summary if available.
+
+Initial response shape:
+
+```json
+{
+  "call": {
+    "id": "call_123",
+    "status": "active",
+    "contextPrompt": "Candidate: Jane Candidate\nRole: Senior Backend Engineer\nInterview focus: distributed systems...",
+    "transcript": [
+      {
+        "id": "seg_123",
+        "speaker": "speaker_1",
+        "role": "unknown",
+        "text": "I led the migration from...",
+        "isFinal": true,
+        "startedAtMs": 12000,
+        "endedAtMs": 18500,
+        "confidence": 0.94
+      }
+    ],
+    "suggestions": [
+      {
+        "id": "sug_123",
+        "text": "Ask how they measured migration success.",
+        "reason": "The candidate mentioned leading a migration but has not described outcomes.",
+        "createdAt": "2026-05-19T12:03:00.000Z"
+      }
+    ],
+    "summary": null
+  }
+}
+```
+
+### `POST /answerCall`
+
+Webhook listener from Telnyx.
+
+Responsibilities:
+
+- validate provider signature and event type
+- parse the Telnyx webhook envelope: `data.record_type`, `data.event_type`, `data.id`, `data.occurred_at`, `data.payload`, and `meta`
+- capture key Telnyx payload fields: `call_control_id`, `connection_id`, `call_leg_id`, `call_session_id`, `client_state`, `from`, `to`, `direction`, and `state`
+- deduplicate repeated webhook deliveries using `data.id` and idempotent command IDs
+- resolve the webhook to a pending internal call record using dialed number, expected caller, conference code, or `client_state`
+- attach the Telnyx call leg to the internal call record
+- answer the call leg
+- create or join the Telnyx conference bridge
+- start media streaming
+- return quickly after dispatching provider actions
+
+The endpoint should not block on long-running transcription or LLM work.
+
+Telnyx delivery constraints to design around:
+
+- Webhooks are HTTP callbacks and use `POST` by default.
+- Telnyx includes `Telnyx-Signature-Ed25519` and `Telnyx-Timestamp` headers for webhook verification.
+- Webhooks may be duplicated, simultaneous, or delivered out of order.
+- Non-2xx webhook responses can trigger retries or failover delivery.
+
+### `GET /calls/:call_id/stream`
+
+Streams live call events to the web UI using SSE-compatible framing.
+
+Use `GET` so the browser UI can consume the stream through native `EventSource`.
+
+Event types:
+
+```text
+event: transcript
+data: {"segmentId":"seg_1","speaker":"speaker_0","role":"unknown","text":"Can you walk me through your last project?","isFinal":true}
+
+event: transcript
+data: {"segmentId":"seg_2","speaker":"speaker_1","role":"unknown","text":"I owned the API migration...","isFinal":true}
+
+event: suggestion
+data: {"suggestionId":"sug_1","text":"Ask what tradeoffs they considered.","reason":"They described a technical decision without alternatives."}
+```
+
+The stream should be an ordered timeline of diarized transcript segments and inserted LLM suggestions. Do not model transcript events as `interviewer_question` or `candidate_response`; the conversation may include clarifications, setup chatter, interruptions, or other speech acts.
+
+## WebSocket Endpoints
+
+The public API list does not include the Telnyx media WebSocket endpoint, but the server will need one.
+
+Proposed endpoint:
+
+- `GET /telnyx/media/:call_id` or `GET /media/telnyx/:call_id`
+
+Responsibilities:
+
+- accept the Telnyx WebSocket upgrade
+- associate the stream with an internal call record
+- parse Telnyx media events
+- forward audio frames to Deepgram
+- handle call end, stream stop, and reconnect events
+
+## Diarization Strategy
+
+Start with three layers, from simplest to more robust:
+
+1. Enable Deepgram diarization on the streaming transcription connection.
+2. Preserve raw Deepgram speaker labels in the transcript model.
+3. Add a best-effort speaker-role mapper later if useful, but keep transcript streaming based on speaker labels rather than hard-coded interviewer/candidate event types.
+
+The role mapper should be explicit and revisable. Example heuristics:
+
+- the first question-like segment is likely interviewer
+- longer explanatory answers after interviewer questions are likely candidate
+- known interviewer/candidate audio channels should override heuristics if Telnyx can provide separated tracks
+- UI should expose uncertain speaker labels as `unknown` rather than pretending confidence is high
+
+Open question for implementation: determine whether the Telnyx conference setup can provide separate audio tracks or metadata for interviewer and candidate. If yes, prefer multichannel transcription over diarization-only role inference.
+
+The LLM may use the diarized transcript and context prompt to infer useful coaching opportunities, but the server should not require reliable role classification before it can stream transcripts.
+
+## Suggestion Engine
+
+The first version should call Mixlayer on a conservative cadence:
+
+- after final transcript content accumulates past a configured threshold
+- no more often than every 15-30 seconds per call
+- immediately after important interview milestones, such as the first substantive answer
+
+Prompt inputs:
+
+- context prompt text supplied to `POST /calls`
+- recent transcript window
+- compact running summary
+- previously suggested questions, to avoid repeats
+
+Expected model output should be structured JSON:
+
+```json
+{
+  "suggestions": [
+    {
+      "text": "Ask how they validated the migration improved reliability.",
+      "reason": "They mentioned a migration but not the success metric.",
+      "priority": "medium",
+      "competency": "technical_depth"
+    }
+  ]
+}
+```
+
+If Mixlayer returns malformed JSON, the provider wrapper should retry once with a repair prompt or fall back to plain text parsing.
+
+## Data Model
+
+Initial in-memory entities:
+
+- `Call`
+  - `id`
+  - `provider`
+  - `dialInNumber`
+  - `conferenceName`
+  - `providerCallId`
+  - `providerCallLegId`
+  - `providerCallSessionId`
+  - `providerConferenceId`
+  - `providerSessionId`
+  - `status`
+  - `contextPrompt`
+  - `startedAt`
+  - `endedAt`
+  - `lastActivityAt`
+- `TranscriptSegment`
+  - `id`
+  - `callId`
+  - `speaker`
+  - `role`
+  - `providerSpeakerLabel`
+  - `text`
+  - `isFinal`
+  - `startedAtMs`
+  - `endedAtMs`
+  - `confidence`
+  - `createdAt`
+- `Suggestion`
+  - `id`
+  - `callId`
+  - `text`
+  - `reason`
+  - `priority`
+  - `competency`
+  - `sourceSegmentIds`
+  - `createdAt`
+- `CallSummary`
+  - `callId`
+  - `text`
+  - `updatedAt`
+
+## Configuration
+
+Use environment variables for the first version:
+
+- `PORT`
+- `PUBLIC_BASE_URL`
+- `TELNYX_API_KEY`
+- `TELNYX_CONNECTION_ID`
+- `TELNYX_WEBHOOK_PUBLIC_KEY` or equivalent signature validation config
+- `DEEPGRAM_API_KEY`
+- `DEEPGRAM_MODEL`
+- `MIXLAYER_API_KEY`
+- `MIXLAYER_BASE_URL`
+- `MIXLAYER_MODEL`
+
+## Implementation Phases
+
+### Phase 1: Project Skeleton
+
+- Initialize TypeScript, Hono, linting/formatting, and test tooling.
+- Add configuration loading and validation.
+- Add basic health endpoint.
+- Define core domain types and datastore interface.
+
+### Phase 2: Call API And Store
+
+- Implement in-memory `CallStore`.
+- Implement `POST /calls` to create pending assistant sessions and return dial-in instructions.
+- Implement `GET /calls`.
+- Implement `GET /calls/:call_id`.
+- Add basic unit tests for call lifecycle and transcript append behavior.
+
+### Phase 3: SSE Event Stream
+
+- Implement per-call event bus.
+- Implement call event publishing for ordered `transcript` and `suggestion` events.
+- Implement `GET /calls/:call_id/stream` using SSE.
+- Add a small manual test client or documented `curl` workflow.
+
+### Phase 4: Telnyx Webhook And Media Stream
+
+- Implement `POST /answerCall`.
+- Add webhook validation and idempotency.
+- Add pending-call resolution from Telnyx webhook data.
+- Add Telnyx REST client wrapper for answer/create-conference/join-conference/start-stream actions.
+- Add Telnyx media WebSocket endpoint.
+- Store raw provider lifecycle events for debugging.
+
+### Phase 5: Deepgram Transcription
+
+- Implement Deepgram streaming client.
+- Pipe Telnyx audio frames into Deepgram.
+- Normalize interim and final transcript events.
+- Enable diarization and preserve provider speaker labels.
+- Broadcast final segments as ordered diarized `transcript` events.
+
+### Phase 6: Mixlayer Suggestions
+
+- Implement OpenAI-compatible chat completions wrapper.
+- Add prompt builder with context, transcript window, running summary, and previous suggestions.
+- Add cadence/rate limiting per call.
+- Store and broadcast suggestions.
+- Add tests around prompt construction and malformed model output handling.
+
+### Phase 7: Summary And Completion
+
+- Detect call end events from Telnyx.
+- Close Deepgram and UI streams cleanly.
+- Generate final summary through Mixlayer.
+- Mark calls completed and decide retention behavior.
+
+### Phase 8: Web UI
+
+- Build a minimal UI that lists active calls.
+- Add call detail view with live transcript.
+- Render diarized transcript segments and inserted suggestions as one ordered timeline.
+- Show speaker uncertainty clearly.
+- Add reconnect behavior for stream interruptions.
+
+### Phase 9: Production Hardening
+
+- Replace in-memory store with persistent storage.
+- Add authentication for UI and internal APIs.
+- Add webhook signature verification tests with fixtures.
+- Add structured logs and call-level tracing.
+- Add provider retry/backoff policies.
+- Add PII retention controls and transcript deletion workflow.
+- Add load testing for concurrent calls.
+
+## Testing Strategy
+
+- Unit tests for call state transitions, transcript assembly, event bus behavior, suggestion cadence, and prompt construction.
+- Integration tests with mocked Telnyx, Deepgram, and Mixlayer clients.
+- Contract fixtures for provider webhooks and media events.
+- Manual end-to-end test with a Telnyx test number once credentials are available.
+- Browser test for UI stream rendering once the UI exists.
+
+## Telnyx Research Findings
+
+### Conferencing Flow
+
+Telnyx supports creating and joining conferences through Voice API conference commands.
+
+- `POST /v2/conferences` creates a conference from an existing call leg using `call_control_id` and automatically bridges that call leg into the conference.
+- `POST /v2/conferences/:id/actions/join` joins another existing call leg into the conference.
+- The join command accepts `client_state`, `command_id`, `hold`, `mute`, `start_conference_on_enter`, `end_conference_on_exit`, and `supervisor_role`.
+- `supervisor_role: "monitor"` lets a participant hear all participants while muted. This is likely the right mode if the assistant must be conferenced in as a passive listener.
+- `supervisor_role: "whisper"` exists if we later want the assistant to speak only to selected participants, but that is out of scope for the first version.
+
+Implications:
+
+- `POST /calls` in our API can create a pending assistant session and return a configured Telnyx dial-in number.
+- The live Telnyx conference bridge cannot be fully created until at least one call leg exists, because Telnyx `POST /v2/conferences` requires `call_control_id`.
+- When the first participant calls in, `/answerCall` should answer the leg and create the Telnyx conference from that leg.
+- Later participant legs can be joined with `POST /v2/conferences/:id/actions/join`.
+- If the existing interview already runs through Telnyx Call Control, attach media streaming to the relevant call leg and avoid adding a new audible participant.
+- If the product requirement requires the assistant to be a conference participant, join an assistant-controlled call leg to the conference as `supervisor_role: "monitor"` and stream media from that leg.
+
+### Media Streaming And Tracks
+
+Telnyx media streaming can be requested when dialing, answering, or by calling `POST /v2/calls/:call_control_id/actions/streaming_start`.
+
+Relevant options:
+
+- `stream_url`: WebSocket destination.
+- `stream_track`: `inbound_track`, `outbound_track`, or `both_tracks`.
+- `stream_codec`: `PCMU`, `PCMA`, `G722`, `OPUS`, `AMR-WB`, `L16`, or `default`.
+- `stream_auth_token`: auth token sent as part of the WebSocket connection.
+- `custom_parameters`: name/value metadata sent as part of the WebSocket connection.
+
+The WebSocket flow includes:
+
+- `connected`
+- `start`, including `call_control_id`, `call_session_id`, `from`, `to`, `client_state`, `media_format`, and `stream_id`
+- `media`, including `track`, `chunk`, `timestamp`, and base64 RTP payload
+- `stop`
+- optional `dtmf`, `mark`, and `error` events
+
+Telnyx explicitly notes that media event order is not guaranteed and that `chunk` can be used to reorder events.
+
+Important limitation: the docs show `media_format.channels: 1` and track values of inbound/outbound. That gives us call-leg direction separation, not guaranteed conference participant separation. We should still rely on Deepgram diarization unless an end-to-end Telnyx conference test proves separate participant tracks are available for our exact call topology.
+
+### Conference Metadata
+
+Conference APIs and webhooks provide useful correlation metadata:
+
+- `conference.participant.joined` includes `call_control_id`, `connection_id`, `call_leg_id`, `call_session_id`, `client_state`, and `conference_id`.
+- Listing conference participants returns participant records with `id`, `call_control_id`, `call_leg_id`, `status`, `muted`, `on_hold`, `conference.id`, and `conference.name`.
+- Conference creation can emit `conference.created`, `conference.participant.joined`, `conference.participant.left`, `conference.ended`, `conference.recording.saved`, and `conference.floor.changed`.
+
+These fields are useful for call lifecycle tracking and participant correlation, but the docs reviewed do not establish a reliable mapping from media frames to individual conference participants.
+
+### Webhook And Command Reliability
+
+Telnyx command and webhook behavior reinforces the datastore design:
+
+- Commands are issued against `call_control_id`.
+- Commands can include `command_id` to avoid duplicate command execution.
+- Webhooks can be duplicated, simultaneous, or out of order.
+- Webhooks include `Telnyx-Signature-Ed25519` and `Telnyx-Timestamp`.
+
+Implementation should persist processed webhook IDs, command IDs, provider IDs, and provider timestamps even in the in-memory version.
+
+Telnyx docs used:
+
+- https://developers.telnyx.com/docs/voice/programmable-voice/media-streaming
+- https://developers.telnyx.com/api-reference/call-commands/streaming-start
+- https://developers.telnyx.com/api-reference/conference-commands/create-conference
+- https://developers.telnyx.com/api-reference/conference-commands/join-a-conference
+- https://developers.telnyx.com/api-reference/conference-commands/list-conference-participants
+- https://developers.telnyx.com/api-reference/callbacks/conference-participant-joined
+
+## Key Open Questions
+
+- Can the exact production call topology provide reliable participant-level audio separation, or only inbound/outbound tracks for a call leg?
+- Should calls be retained after completion in the first version, or should completed calls be removed from memory?
+- What latency target is acceptable for suggestions: near real-time, every answer, or periodic coaching?
+- Should interviewer suggestions be purely question suggestions, or should they include evaluation notes and rubric coverage?
+
+## Immediate Next Step
+
+Research and implementation preparation before writing production integration code:
+
+1. Run a Telnyx sandbox/manual call test for the target conference topology and capture real webhook plus media WebSocket fixtures.
+2. Decide the routing mechanism from inbound Telnyx webhook to pending internal call: unique dial-in number, conference code, expected caller number, or provider metadata.
+3. Decide whether the first implementation streams an existing interview call leg or joins an assistant call leg as `supervisor_role: "monitor"`.
+4. Decide completed-call retention behavior for the in-memory prototype.
+5. Confirm Deepgram input format for Telnyx RTP payloads for the selected `stream_codec`, with `PCMU` as the simplest default and `L16` as a lower-transcoding option to evaluate.

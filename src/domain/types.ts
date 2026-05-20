@@ -13,6 +13,13 @@ export type Provider = "telnyx";
 
 export type SpeakerRole = "interviewer" | "candidate" | "unknown";
 
+export type ProviderCallLegStatus =
+  | "initiated"
+  | "answered"
+  | "joined"
+  | "completed"
+  | "failed";
+
 export interface CreateCallInput {
   contextPrompt: string;
   dialInNumber: string;
@@ -29,11 +36,26 @@ export interface Call {
   providerCallSessionId?: string;
   providerConferenceId?: string;
   providerSessionId?: string;
+  providerCallLegs: ProviderCallLeg[];
   status: CallStatus;
   contextPrompt: string;
   startedAt: Date;
   endedAt?: Date;
   lastActivityAt: Date;
+}
+
+export interface ProviderCallLeg {
+  callControlId: string;
+  callLegId?: string;
+  callSessionId?: string;
+  connectionId?: string;
+  from?: string;
+  to?: string;
+  direction?: string;
+  status: ProviderCallLegStatus;
+  createdAt: Date;
+  answeredAt?: Date;
+  endedAt?: Date;
 }
 
 export interface TranscriptSegment {

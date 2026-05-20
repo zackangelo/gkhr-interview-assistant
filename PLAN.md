@@ -364,14 +364,14 @@ Use environment variables for the first version:
 - [x] Implement `GET /calls/:call_id/stream` using SSE.
 - [x] Add a small manual test client or documented `curl` workflow.
 
-### Phase 4: Telnyx Webhook And Media Stream
+### Phase 4: Telnyx Webhook And Media Stream (Completed)
 
-- Implement `POST /answerCall`.
-- Add webhook validation and idempotency.
-- Add pending-call resolution from Telnyx webhook data.
-- Add Telnyx REST client wrapper for answer/create-conference/join-conference/start-stream actions.
-- Add Telnyx media WebSocket endpoint.
-- Store raw provider lifecycle events for debugging.
+- [x] Implement `POST /answerCall`.
+- [x] Add webhook validation and idempotency.
+- [x] Add pending-call resolution from Telnyx webhook data.
+- [x] Add Telnyx REST client wrapper for answer/create-conference/join-conference/start-stream actions.
+- [x] Add Telnyx media WebSocket endpoint.
+- [x] Store raw provider lifecycle events for debugging.
 
 ### Phase 5: Deepgram Transcription
 

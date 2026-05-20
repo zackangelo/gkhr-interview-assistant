@@ -36,6 +36,9 @@ Transcript and suggestion events are published by the internal call event bus;
 Telnyx, Deepgram, and Mixlayer integrations will feed this stream in later
 phases.
 
+The app loads `.env` automatically when started through `src/index.ts` or the
+compiled `dist/index.js`.
+
 ## Local Telnyx Webhook Testing With Tailscale Funnel
 
 Telnyx needs a publicly reachable webhook URL. For local development, use
@@ -77,10 +80,25 @@ Use the public URL plus the webhook route when configuring Telnyx. For example:
 https://my-laptop.example.ts.net/answerCall
 ```
 
+For inbound Telnyx calls, create a pending app call before dialing the Telnyx
+number. The webhook handler resolves inbound `call.initiated` events against
+pending calls by dial-in number, answers the Telnyx call leg, creates or joins a
+Telnyx conference after `call.answered`, and starts media streaming to:
+
+```text
+wss://my-laptop.example.ts.net/media/telnyx/{call_id}
+```
+
 To inspect whether the server received a webhook, open:
 
 ```text
 https://my-laptop.example.ts.net/webhook-pings
+```
+
+To inspect raw Telnyx media WebSocket events captured for a call:
+
+```text
+https://my-laptop.example.ts.net/media/telnyx/{call_id}/events
 ```
 
 You can also smoke-test the receiver without Telnyx:

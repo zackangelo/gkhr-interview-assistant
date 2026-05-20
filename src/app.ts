@@ -1,14 +1,30 @@
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
+import type { UpgradeWebSocket } from "hono/ws";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
 import type { AppConfig } from "./config.js";
 import type { CallStore } from "./domain/call-store.js";
-import type { Call, Suggestion, TranscriptSegment } from "./domain/types.js";
+import type {
+  Call,
+  ProviderCallLeg,
+  ProviderCallLegStatus,
+  Suggestion,
+  TranscriptSegment,
+} from "./domain/types.js";
 import type { CallEventBus } from "./events/call-event-bus.js";
 import { InMemoryCallEventBus } from "./events/call-event-bus.js";
 import { InMemoryCallStore } from "./store/in-memory-call-store.js";
+import type { TelnyxClient } from "./telnyx/client.js";
+import { HttpTelnyxClient } from "./telnyx/client.js";
+import type { MediaStreamStore } from "./telnyx/media-stream-store.js";
+import { InMemoryMediaStreamStore } from "./telnyx/media-stream-store.js";
+import {
+  parseTelnyxWebhookEvent,
+  verifyTelnyxWebhookSignature,
+  type TelnyxWebhookEvent,
+} from "./telnyx/webhooks.js";
 
 interface WebhookPing {
   id: string;
@@ -25,6 +41,8 @@ const maxWebhookPings = 20;
 interface AppDependencies {
   callStore?: CallStore;
   eventBus?: CallEventBus;
+  mediaStreamStore?: MediaStreamStore;
+  telnyxClient?: TelnyxClient;
 }
 
 const createCallSchema = z.object({
@@ -39,7 +57,13 @@ export function createApp(
   const app = new Hono();
   const callStore = dependencies.callStore ?? new InMemoryCallStore();
   const eventBus = dependencies.eventBus ?? new InMemoryCallEventBus();
+  const mediaStreamStore =
+    dependencies.mediaStreamStore ?? new InMemoryMediaStreamStore();
+  const telnyxClient =
+    dependencies.telnyxClient ??
+    (config.telnyxApiKey ? new HttpTelnyxClient(config.telnyxApiKey) : null);
   const webhookPings: WebhookPing[] = [];
+  const processedWebhookIds = new Set<string>();
 
   app.get("/", (c) => {
     return c.json({
@@ -197,10 +221,98 @@ export function createApp(
     webhookPings.unshift(ping);
     webhookPings.splice(maxWebhookPings);
 
+    if (config.telnyxWebhookPublicKey) {
+      const signatureValid = verifyTelnyxWebhookSignature({
+        rawBody,
+        publicKey: config.telnyxWebhookPublicKey,
+        signature: c.req.header("telnyx-signature-ed25519") ?? null,
+        timestamp: c.req.header("telnyx-timestamp") ?? null,
+      });
+
+      if (!signatureValid) {
+        return c.json(
+          {
+            error: {
+              code: "invalid_signature",
+              message: "Invalid Telnyx webhook signature.",
+            },
+          },
+          401,
+        );
+      }
+    }
+
+    const event = parseTelnyxWebhookEvent(ping.body);
+    if (!event) {
+      return c.json(
+        {
+          error: {
+            code: "invalid_webhook",
+            message: "Invalid Telnyx webhook payload.",
+          },
+        },
+        400,
+      );
+    }
+
+    if (processedWebhookIds.has(event.data.id)) {
+      return c.json({
+        ok: true,
+        duplicate: true,
+        id: ping.id,
+        receivedAt: ping.receivedAt,
+      });
+    }
+
+    try {
+      const result = await handleTelnyxWebhookEvent({
+        callStore,
+        config,
+        event,
+        telnyxClient,
+      });
+      processedWebhookIds.add(event.data.id);
+
+      return c.json({
+        ok: true,
+        id: ping.id,
+        receivedAt: ping.receivedAt,
+        result,
+      });
+    } catch (error) {
+      console.error("Failed to handle Telnyx webhook", error);
+      return c.json(
+        {
+          error: {
+            code: "telnyx_webhook_failed",
+            message: "Failed to process Telnyx webhook.",
+          },
+        },
+        500,
+      );
+    }
+  });
+
+  app.get("/media/telnyx/:call_id/events", async (c) => {
+    const callId = c.req.param("call_id");
+    const call = await callStore.getCall(callId);
+    if (!call) {
+      return c.json(
+        {
+          error: {
+            code: "not_found",
+            message: `Call not found: ${callId}`,
+          },
+        },
+        404,
+      );
+    }
+
     return c.json({
-      ok: true,
-      id: ping.id,
-      receivedAt: ping.receivedAt,
+      events: (await mediaStreamStore.listEvents(callId)).map((event) => ({
+        ...event,
+        receivedAt: event.receivedAt.toISOString(),
+      })),
     });
   });
 
@@ -211,6 +323,322 @@ export function createApp(
   });
 
   return app;
+}
+
+export function registerMediaWebSocketRoute(
+  app: Hono,
+  input: {
+    upgradeWebSocket: UpgradeWebSocket;
+    mediaStreamStore: MediaStreamStore;
+  },
+): void {
+  app.get(
+    "/media/telnyx/:call_id",
+    input.upgradeWebSocket((c) => {
+      const callId = c.req.param("call_id") ?? "unknown";
+
+      return {
+        onOpen: async () => {
+          await input.mediaStreamStore.recordEvent({
+            id: randomUUID(),
+            callId,
+            receivedAt: new Date(),
+            event: { event: "socket.open" },
+          });
+        },
+        onMessage: async (message) => {
+          await input.mediaStreamStore.recordEvent({
+            id: randomUUID(),
+            callId,
+            receivedAt: new Date(),
+            event: parseJson(String(message.data)) ?? message.data,
+          });
+        },
+        onClose: async (event) => {
+          await input.mediaStreamStore.recordEvent({
+            id: randomUUID(),
+            callId,
+            receivedAt: new Date(),
+            event: {
+              event: "socket.close",
+              code: event.code,
+              reason: event.reason,
+            },
+          });
+        },
+        onError: async (event) => {
+          await input.mediaStreamStore.recordEvent({
+            id: randomUUID(),
+            callId,
+            receivedAt: new Date(),
+            event: {
+              event: "socket.error",
+              message:
+                event instanceof ErrorEvent
+                  ? String(event.message)
+                  : "WebSocket error",
+            },
+          });
+        },
+      };
+    }),
+  );
+}
+
+async function handleTelnyxWebhookEvent(input: {
+  callStore: CallStore;
+  config: AppConfig;
+  event: TelnyxWebhookEvent;
+  telnyxClient: TelnyxClient | null;
+}) {
+  const eventType = input.event.data.event_type;
+  const payload = input.event.data.payload;
+
+  if (eventType === "call.initiated") {
+    const callControlId = readString(payload.call_control_id);
+    const to = readString(payload.to);
+    if (!callControlId || !to) {
+      return { action: "ignored", reason: "missing_call_control_or_to" };
+    }
+
+    const call = await resolveCallForIncomingWebhook(input.callStore, to);
+    if (!call) {
+      return { action: "ignored", reason: "no_matching_call" };
+    }
+
+    const updatedCall = await input.callStore.updateCall(call.id, {
+      providerCallId: call.providerCallId ?? callControlId,
+      providerCallLegId:
+        call.providerCallLegId ?? readString(payload.call_leg_id) ?? undefined,
+      providerCallSessionId:
+        call.providerCallSessionId ??
+        readString(payload.call_session_id) ??
+        undefined,
+      providerCallLegs: upsertCallLeg(call, payload, "initiated"),
+      status: "ringing",
+    });
+
+    await requireTelnyxClient(input.telnyxClient).answerCall({
+      callControlId,
+      commandId: `answer:${input.event.data.id}`,
+    });
+
+    return {
+      action: "answer_sent",
+      callId: updatedCall.id,
+      callControlId,
+    };
+  }
+
+  if (eventType === "call.answered") {
+    const callControlId = readString(payload.call_control_id);
+    if (!callControlId) {
+      return { action: "ignored", reason: "missing_call_control" };
+    }
+
+    const call = await findCallByCallControlId(input.callStore, callControlId);
+    if (!call) {
+      return { action: "ignored", reason: "no_matching_call" };
+    }
+
+    const activeCall = await input.callStore.updateCall(call.id, {
+      providerCallLegs: upsertCallLeg(call, payload, "answered", {
+        answeredAt: new Date(input.event.data.occurred_at ?? Date.now()),
+      }),
+      status: "active",
+    });
+    const telnyxClient = requireTelnyxClient(input.telnyxClient);
+
+    if (activeCall.providerConferenceId) {
+      await telnyxClient.joinConference({
+        conferenceId: activeCall.providerConferenceId,
+        callControlId,
+        commandId: `join-conference:${input.event.data.id}`,
+      });
+    } else {
+      const conference = await telnyxClient.createConference({
+        callControlId,
+        conferenceName: activeCall.conferenceName,
+        commandId: `create-conference:${input.event.data.id}`,
+      });
+
+      if (conference.conferenceId) {
+        await input.callStore.updateCall(activeCall.id, {
+          providerConferenceId: conference.conferenceId,
+        });
+      }
+    }
+
+    const streamUrl = buildTelnyxMediaStreamUrl(input.config, activeCall.id);
+    if (streamUrl) {
+      await telnyxClient.startStreaming({
+        callControlId,
+        streamUrl,
+        commandId: `streaming-start:${input.event.data.id}`,
+      });
+    }
+
+    return {
+      action: activeCall.providerConferenceId
+        ? "join_conference_sent"
+        : "create_conference_sent",
+      callId: activeCall.id,
+      callControlId,
+      streamUrl,
+    };
+  }
+
+  if (
+    eventType === "conference.created" ||
+    eventType === "conference.participant.joined"
+  ) {
+    const callControlId = readString(payload.call_control_id);
+    const conferenceId = readString(payload.conference_id);
+    if (!callControlId || !conferenceId) {
+      return { action: "ignored", reason: "missing_conference_fields" };
+    }
+
+    const call = await findCallByCallControlId(input.callStore, callControlId);
+    if (!call) {
+      return { action: "ignored", reason: "no_matching_call" };
+    }
+
+    await input.callStore.updateCall(call.id, {
+      providerConferenceId: conferenceId,
+      providerCallLegs: upsertCallLeg(call, payload, "joined"),
+      status: "active",
+    });
+
+    return {
+      action: "conference_recorded",
+      callId: call.id,
+      conferenceId,
+    };
+  }
+
+  if (eventType === "call.hangup") {
+    const callControlId = readString(payload.call_control_id);
+    if (!callControlId) {
+      return { action: "ignored", reason: "missing_call_control" };
+    }
+
+    const call = await findCallByCallControlId(input.callStore, callControlId);
+    if (!call) {
+      return { action: "ignored", reason: "no_matching_call" };
+    }
+
+    await input.callStore.updateCall(call.id, {
+      providerCallLegs: upsertCallLeg(call, payload, "completed", {
+        endedAt: new Date(input.event.data.occurred_at ?? Date.now()),
+      }),
+      status: "completed",
+      endedAt: new Date(input.event.data.occurred_at ?? Date.now()),
+    });
+
+    return {
+      action: "call_completed",
+      callId: call.id,
+    };
+  }
+
+  return {
+    action: "ignored",
+    reason: `unsupported_event:${eventType}`,
+  };
+}
+
+async function resolveCallForIncomingWebhook(
+  callStore: CallStore,
+  dialInNumber: string,
+): Promise<Call | null> {
+  const calls = await callStore.listCalls();
+  const matchingCalls = calls.filter(
+    (call) =>
+      call.dialInNumber === dialInNumber &&
+      call.status !== "completed" &&
+      call.status !== "failed",
+  );
+
+  return (
+    matchingCalls.find((call) => call.status === "pending") ??
+    matchingCalls[0] ??
+    null
+  );
+}
+
+async function findCallByCallControlId(
+  callStore: CallStore,
+  callControlId: string,
+): Promise<Call | null> {
+  const calls = await callStore.listCalls();
+  return (
+    calls.find(
+      (call) =>
+        call.providerCallId === callControlId ||
+        call.providerCallLegs.some(
+          (leg) => leg.callControlId === callControlId,
+        ),
+    ) ?? null
+  );
+}
+
+function upsertCallLeg(
+  call: Call,
+  payload: Record<string, unknown>,
+  status: ProviderCallLegStatus,
+  timestamps: Pick<Partial<ProviderCallLeg>, "answeredAt" | "endedAt"> = {},
+): ProviderCallLeg[] {
+  const callControlId = readString(payload.call_control_id);
+  if (!callControlId) {
+    return call.providerCallLegs;
+  }
+
+  const existingLeg = call.providerCallLegs.find(
+    (leg) => leg.callControlId === callControlId,
+  );
+  const nextLeg: ProviderCallLeg = {
+    callControlId,
+    callLegId: readString(payload.call_leg_id) ?? existingLeg?.callLegId,
+    callSessionId:
+      readString(payload.call_session_id) ?? existingLeg?.callSessionId,
+    connectionId:
+      readString(payload.connection_id) ?? existingLeg?.connectionId,
+    from: readString(payload.from) ?? existingLeg?.from,
+    to: readString(payload.to) ?? existingLeg?.to,
+    direction: readString(payload.direction) ?? existingLeg?.direction,
+    status,
+    createdAt: existingLeg?.createdAt ?? new Date(),
+    answeredAt: timestamps.answeredAt ?? existingLeg?.answeredAt,
+    endedAt: timestamps.endedAt ?? existingLeg?.endedAt,
+  };
+
+  return [
+    ...call.providerCallLegs.filter(
+      (leg) => leg.callControlId !== callControlId,
+    ),
+    nextLeg,
+  ];
+}
+
+function requireTelnyxClient(telnyxClient: TelnyxClient | null): TelnyxClient {
+  if (!telnyxClient) {
+    throw new Error("TELNYX_API_KEY is required to control Telnyx calls.");
+  }
+
+  return telnyxClient;
+}
+
+function buildTelnyxMediaStreamUrl(
+  config: AppConfig,
+  callId: string,
+): string | null {
+  if (!config.publicBaseUrl) {
+    return null;
+  }
+
+  const streamUrl = new URL(`/media/telnyx/${callId}`, config.publicBaseUrl);
+  streamUrl.protocol = streamUrl.protocol === "https:" ? "wss:" : "ws:";
+  return streamUrl.toString();
 }
 
 function serializeCallSummary(call: Call) {
@@ -235,9 +663,19 @@ function serializeCall(call: Call) {
     providerCallSessionId: call.providerCallSessionId ?? null,
     providerConferenceId: call.providerConferenceId ?? null,
     providerSessionId: call.providerSessionId ?? null,
+    providerCallLegs: call.providerCallLegs.map((leg) => ({
+      ...leg,
+      createdAt: leg.createdAt.toISOString(),
+      answeredAt: leg.answeredAt ? leg.answeredAt.toISOString() : null,
+      endedAt: leg.endedAt ? leg.endedAt.toISOString() : null,
+    })),
     contextPrompt: call.contextPrompt,
     endedAt: call.endedAt ? call.endedAt.toISOString() : null,
   };
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 function serializeTranscriptSegment(segment: TranscriptSegment) {

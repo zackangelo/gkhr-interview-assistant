@@ -42,6 +42,7 @@ export class InMemoryCallStore implements CallStore {
       provider: "telnyx",
       dialInNumber: input.dialInNumber,
       conferenceName: input.conferenceName,
+      providerCallLegs: [],
       status: "pending",
       contextPrompt: input.contextPrompt,
       startedAt: now,
@@ -145,6 +146,12 @@ export class InMemoryCallStore implements CallStore {
 function cloneCall(call: Call): Call {
   return {
     ...call,
+    providerCallLegs: call.providerCallLegs.map((leg) => ({
+      ...leg,
+      createdAt: new Date(leg.createdAt),
+      answeredAt: leg.answeredAt ? new Date(leg.answeredAt) : undefined,
+      endedAt: leg.endedAt ? new Date(leg.endedAt) : undefined,
+    })),
     startedAt: new Date(call.startedAt),
     endedAt: call.endedAt ? new Date(call.endedAt) : undefined,
     lastActivityAt: new Date(call.lastActivityAt),

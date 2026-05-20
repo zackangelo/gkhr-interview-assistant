@@ -485,6 +485,16 @@ Telnyx explicitly notes that media event order is not guaranteed and that `chunk
 
 Important limitation: the docs show `media_format.channels: 1` and track values of inbound/outbound. That gives us call-leg direction separation, not guaranteed conference participant separation. We should still rely on Deepgram diarization unless an end-to-end Telnyx conference test proves separate participant tracks are available for our exact call topology.
 
+Live test result on May 19, 2026:
+
+- Telnyx successfully connected to `wss://zack-macbook-2024.tailbfe4ed.ts.net/media/telnyx/:call_id`.
+- The stream delivered `media` events on both `inbound` and `outbound` tracks.
+- The stream ended with a `stop` event followed by WebSocket close code `1005`.
+- The app captured media frames with monotonically increasing `sequence_number` values.
+- The observed stream used one stream ID for both tracks: `d96484ea-a86d-4ec6-b4ee-5415faefdf09`.
+
+This confirms that Phase 5 should consume Telnyx WebSocket media events directly from `/media/telnyx/:call_id`, decode the base64 RTP payload, and forward the audio frames to Deepgram.
+
 ### Conference Metadata
 
 Conference APIs and webhooks provide useful correlation metadata:
@@ -586,6 +596,54 @@ Implementation implications:
 - Store `payload.call_control_id`, `payload.call_leg_id`, `payload.call_session_id`, `payload.connection_id`, `payload.from`, and `payload.to`.
 - Preserve Telnyx signature headers for verification tests, but do not store full request headers in production.
 
+### Live Telnyx Integration Test
+
+Completed on May 19, 2026 using:
+
+- Dial-in number: `+15122548727`
+- Internal call ID: `e1e950a9-d995-441f-931c-752628bb62f8`
+- Conference name: `test-interview-bridge`
+
+Observed event sequence:
+
+1. `call.initiated`
+2. `call.answered`
+3. `conference.floor.changed`
+4. `streaming.started`
+5. `conference.created`
+6. `conference.participant.joined`
+7. WebSocket `media` events on `inbound` and `outbound` tracks
+8. WebSocket `stop`
+9. `streaming.stopped`
+10. `call.hangup`
+11. `conference.participant.left`
+12. `conference.ended`
+
+Confirmed state after hangup:
+
+- Call status: `completed`
+- `providerCallId`: `v3:HcXFeJ34Z7VGDHDY-8xR8xsz1togxMxhlKObgbPUkKakdi6Eh0iWJQ`
+- `providerCallLegId`: `6fc9bb8a-53df-11f1-af0f-02420aef961f`
+- `providerCallSessionId`: `6fc9b1e4-53df-11f1-9ecd-02420aef961f`
+- `providerConferenceId`: `d4be636f-dfb1-453b-8bca-18c88bd7a6b8`
+- Hangup cause: `normal_clearing`
+- Hangup source: `caller`
+
+Confirmed behavior:
+
+- Pending-call resolution by dial-in number worked for this single-call test.
+- Answer command stopped ringback and produced `call.answered`.
+- Create-conference command produced `conference.created` and `conference.participant.joined`.
+- Streaming-start command produced `streaming.started`.
+- Telnyx delivered media WebSocket frames until the caller hung up.
+- No transcript or suggestion events were produced yet because Deepgram and Mixlayer are not wired.
+
+Implementation implications:
+
+- Phase 4 is validated end to end for a single inbound participant.
+- Phase 5 can start from captured Telnyx media events rather than needing more Call Control plumbing.
+- Multi-participant routing is still unvalidated and remains a design question for later participant legs.
+
 ### Webhook And Command Reliability
 
 Telnyx command and webhook behavior reinforces the datastore design:
@@ -618,8 +676,8 @@ Telnyx docs used:
 
 Research and implementation preparation before writing production integration code:
 
-1. Implement Answer command handling for observed inbound `call.initiated` events.
-2. Decide the routing mechanism from inbound Telnyx webhook to pending internal call: unique dial-in number, conference code, expected caller number, or provider metadata.
-3. Decide whether the first implementation streams an existing interview call leg or joins an assistant call leg as `supervisor_role: "monitor"`.
-4. Decide completed-call retention behavior for the in-memory prototype.
-5. Confirm Deepgram input format for Telnyx RTP payloads for the selected `stream_codec`, with `PCMU` as the simplest default and `L16` as a lower-transcoding option to evaluate.
+1. Implement Deepgram streaming transcription from observed Telnyx WebSocket media frames.
+2. Confirm whether Deepgram should receive the current `PCMU` stream directly or whether we should switch Telnyx `stream_codec` to `L16`.
+3. Decide whether to transcribe both `inbound` and `outbound` tracks, only `inbound`, or merge both before Deepgram.
+4. Decide the routing mechanism from inbound Telnyx webhook to pending internal call for multi-call or multi-participant scenarios: unique dial-in number, conference code, expected caller number, or provider metadata.
+5. Decide completed-call retention behavior for the in-memory prototype.

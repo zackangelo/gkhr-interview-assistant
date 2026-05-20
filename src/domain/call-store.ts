@@ -13,6 +13,7 @@ export interface CallStore {
   listCalls(): Promise<Call[]>;
   updateCall(callId: CallId, patch: Partial<Call>): Promise<Call>;
   appendTranscriptSegment(segment: TranscriptSegment): Promise<void>;
+  upsertTranscriptSegment(segment: TranscriptSegment): Promise<void>;
   listTranscriptSegments(callId: CallId): Promise<TranscriptSegment[]>;
   appendSuggestion(suggestion: Suggestion): Promise<void>;
   listSuggestions(callId: CallId): Promise<Suggestion[]>;

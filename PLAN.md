@@ -375,11 +375,25 @@ Use environment variables for the first version:
 
 ### Phase 5: Deepgram Transcription
 
-- Implement Deepgram streaming client.
-- Pipe Telnyx audio frames into Deepgram.
-- Normalize interim and final transcript events.
-- Enable diarization and preserve provider speaker labels.
-- Broadcast final segments as ordered diarized `transcript` events.
+- [x] Implement Deepgram streaming client.
+- [x] Pipe Telnyx audio frames into Deepgram.
+- [x] Normalize interim and final transcript events.
+- [x] Enable diarization and preserve provider speaker labels.
+- [x] Broadcast transcript segments as ordered diarized `transcript` events.
+
+Implementation notes:
+
+- The app now uses the official `@deepgram/sdk` live transcription connection when `DEEPGRAM_API_KEY` is set.
+- Telnyx `PCMU` media is sent to Deepgram as raw `mulaw` audio with `sample_rate: 8000`.
+- Telnyx inbound and outbound tracks are transcribed with separate Deepgram sessions so track direction is preserved instead of mixing both tracks into one mono stream.
+- Deepgram diarization labels are preserved as `providerSpeakerLabel`; app-level speaker names include the Telnyx track, such as `telnyx_inbound_speaker_0`.
+- Interim and final transcript updates reuse the same transcript segment id when Deepgram reports the same track, speaker, and start time. This lets the UI replace interim text with final text later.
+- Unit coverage uses mocked transcribers; live Deepgram validation against a real Telnyx call is still pending.
+- Local verification passed with `npm run typecheck`, `npm test`, `npm run format`, and `npm run build`.
+
+Follow-up TODO:
+
+- [ ] Improve transcript reconciliation so an interim segment can be replaced by a nearby final segment from the same Telnyx track and Deepgram speaker even when Deepgram shifts the reported segment start time. Live test `8a9059c1-5e99-4d58-9d21-ce3aaaf851f7` left both interim `"Anyone"` and final `"Anyone there?"` because the start moved from `5050ms` to `5130ms`.
 
 ### Phase 6: Mixlayer Suggestions
 
@@ -636,12 +650,12 @@ Confirmed behavior:
 - Create-conference command produced `conference.created` and `conference.participant.joined`.
 - Streaming-start command produced `streaming.started`.
 - Telnyx delivered media WebSocket frames until the caller hung up.
-- No transcript or suggestion events were produced yet because Deepgram and Mixlayer are not wired.
+- No transcript or suggestion events were produced in this test because Deepgram and Mixlayer were not wired at the time.
 
 Implementation implications:
 
 - Phase 4 is validated end to end for a single inbound participant.
-- Phase 5 can start from captured Telnyx media events rather than needing more Call Control plumbing.
+- Phase 5 starts from captured Telnyx media events rather than needing more Call Control plumbing.
 - Multi-participant routing is still unvalidated and remains a design question for later participant legs.
 
 ### Webhook And Command Reliability
@@ -674,10 +688,10 @@ Telnyx docs used:
 
 ## Immediate Next Step
 
-Research and implementation preparation before writing production integration code:
+Live validation and Phase 6 preparation:
 
-1. Implement Deepgram streaming transcription from observed Telnyx WebSocket media frames.
-2. Confirm whether Deepgram should receive the current `PCMU` stream directly or whether we should switch Telnyx `stream_codec` to `L16`.
-3. Decide whether to transcribe both `inbound` and `outbound` tracks, only `inbound`, or merge both before Deepgram.
+1. Place another Telnyx test call with `DEEPGRAM_API_KEY` configured and verify that `/calls/:call_id/stream` emits transcript events.
+2. Inspect whether useful speech lands on `inbound`, `outbound`, or both tracks for the intended interview topology.
+3. Start Phase 6 by adding the Mixlayer chat completions client and suggestion cadence.
 4. Decide the routing mechanism from inbound Telnyx webhook to pending internal call for multi-call or multi-participant scenarios: unique dial-in number, conference code, expected caller number, or provider metadata.
 5. Decide completed-call retention behavior for the in-memory prototype.

@@ -25,6 +25,8 @@ import {
   verifyTelnyxWebhookSignature,
   type TelnyxWebhookEvent,
 } from "./telnyx/webhooks.js";
+import { TelnyxMediaTranscriptionSession } from "./transcription/telnyx-media-transcription.js";
+import type { StreamingTranscriber } from "./transcription/transcriber.js";
 
 interface WebhookPing {
   id: string;
@@ -330,15 +332,28 @@ export function registerMediaWebSocketRoute(
   input: {
     upgradeWebSocket: UpgradeWebSocket;
     mediaStreamStore: MediaStreamStore;
+    callStore?: CallStore;
+    eventBus?: CallEventBus;
+    transcriber?: StreamingTranscriber | null;
   },
 ): void {
   app.get(
     "/media/telnyx/:call_id",
     input.upgradeWebSocket((c) => {
       const callId = c.req.param("call_id") ?? "unknown";
+      let transcriptionSession: TelnyxMediaTranscriptionSession | null = null;
 
       return {
         onOpen: async () => {
+          if (input.callStore && input.eventBus) {
+            transcriptionSession = new TelnyxMediaTranscriptionSession({
+              callId,
+              callStore: input.callStore,
+              eventBus: input.eventBus,
+              transcriber: input.transcriber ?? null,
+            });
+          }
+
           await input.mediaStreamStore.recordEvent({
             id: randomUUID(),
             callId,
@@ -347,12 +362,22 @@ export function registerMediaWebSocketRoute(
           });
         },
         onMessage: async (message) => {
+          const event = parseJson(String(message.data)) ?? message.data;
           await input.mediaStreamStore.recordEvent({
             id: randomUUID(),
             callId,
             receivedAt: new Date(),
-            event: parseJson(String(message.data)) ?? message.data,
+            event,
           });
+
+          await transcriptionSession
+            ?.handleEvent(event)
+            .catch((error: unknown) => {
+              console.error("Failed to handle Telnyx media event", {
+                callId,
+                error,
+              });
+            });
         },
         onClose: async (event) => {
           await input.mediaStreamStore.recordEvent({
@@ -365,6 +390,7 @@ export function registerMediaWebSocketRoute(
               reason: event.reason,
             },
           });
+          await transcriptionSession?.close();
         },
         onError: async (event) => {
           await input.mediaStreamStore.recordEvent({
@@ -373,12 +399,10 @@ export function registerMediaWebSocketRoute(
             receivedAt: new Date(),
             event: {
               event: "socket.error",
-              message:
-                event instanceof ErrorEvent
-                  ? String(event.message)
-                  : "WebSocket error",
+              message: getWebSocketErrorMessage(event),
             },
           });
+          await transcriptionSession?.close();
         },
       };
     }),
@@ -724,6 +748,22 @@ function parseJson(rawBody: string): unknown {
   } catch {
     return null;
   }
+}
+
+function getWebSocketErrorMessage(event: unknown): string {
+  if (event instanceof Error) {
+    return event.message;
+  }
+
+  if (
+    typeof ErrorEvent !== "undefined" &&
+    event instanceof ErrorEvent &&
+    event.message
+  ) {
+    return String(event.message);
+  }
+
+  return "WebSocket error";
 }
 
 function redactHeaders(headers: Headers): Record<string, string> {

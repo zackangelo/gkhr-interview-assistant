@@ -32,9 +32,8 @@ curl -N http://localhost:3000/calls/{call_id}/stream
 ```
 
 The stream emits ordered `transcript` and `suggestion` Server-Sent Events.
-Transcript and suggestion events are published by the internal call event bus;
-Telnyx, Deepgram, and Mixlayer integrations will feed this stream in later
-phases.
+Transcript events are published from Deepgram results when `DEEPGRAM_API_KEY`
+is set. Suggestion events will be added with the Mixlayer phase.
 
 The app loads `.env` automatically when started through `src/index.ts` or the
 compiled `dist/index.js`.
@@ -99,6 +98,12 @@ To inspect raw Telnyx media WebSocket events captured for a call:
 
 ```text
 https://my-laptop.example.ts.net/media/telnyx/{call_id}/events
+```
+
+To inspect transcript output after a call has media, use the call detail route:
+
+```text
+https://my-laptop.example.ts.net/calls/{call_id}
 ```
 
 You can also smoke-test the receiver without Telnyx:

@@ -85,10 +85,22 @@ export class InMemoryCallStore implements CallStore {
   }
 
   async appendTranscriptSegment(segment: TranscriptSegment): Promise<void> {
+    await this.upsertTranscriptSegment(segment);
+  }
+
+  async upsertTranscriptSegment(segment: TranscriptSegment): Promise<void> {
     await this.assertCallExists(segment.callId);
 
     const segments = this.transcriptSegments.get(segment.callId) ?? [];
-    segments.push(cloneTranscriptSegment(segment));
+    const existingIndex = segments.findIndex(
+      (currentSegment) => currentSegment.id === segment.id,
+    );
+    if (existingIndex >= 0) {
+      segments[existingIndex] = cloneTranscriptSegment(segment);
+    } else {
+      segments.push(cloneTranscriptSegment(segment));
+    }
+
     segments.sort((left, right) => left.startedAtMs - right.startedAtMs);
     this.transcriptSegments.set(segment.callId, segments);
     await this.touchCall(segment.callId);

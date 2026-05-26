@@ -95,7 +95,7 @@ describe("TelnyxMediaTranscriptionSession", () => {
     ]);
   });
 
-  it("upserts transcript segments and publishes call events", async () => {
+  it("records only final transcript segments and publishes call events", async () => {
     const callStore = new InMemoryCallStore({ createId: () => "call_123" });
     const eventBus = new InMemoryCallEventBus({
       createId: () => "event_123",
@@ -132,6 +132,9 @@ describe("TelnyxMediaTranscriptionSession", () => {
       confidence: 0.8,
       providerSpeakerLabel: "speaker_0",
     });
+    await expect(callStore.listTranscriptSegments(call.id)).resolves.toEqual(
+      [],
+    );
     await transcriber.sessions[0].emitTranscript({
       text: "hello there",
       isFinal: true,
@@ -162,8 +165,8 @@ describe("TelnyxMediaTranscriptionSession", () => {
       callId: call.id,
       data: {
         segmentId: "transcript_call_123_outbound_speaker_0_100",
-        text: "hello",
-        isFinal: false,
+        text: "hello there",
+        isFinal: true,
       },
     });
   });

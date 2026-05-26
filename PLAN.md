@@ -377,7 +377,7 @@ Use environment variables for the first version:
 
 - [x] Implement Deepgram streaming client.
 - [x] Pipe Telnyx audio frames into Deepgram.
-- [x] Normalize interim and final transcript events.
+- [x] Normalize Deepgram results and record only final transcript events.
 - [x] Enable diarization and preserve provider speaker labels.
 - [x] Broadcast transcript segments as ordered diarized `transcript` events.
 
@@ -387,13 +387,13 @@ Implementation notes:
 - Telnyx `PCMU` media is sent to Deepgram as raw `mulaw` audio with `sample_rate: 8000`.
 - Telnyx inbound and outbound tracks are transcribed with separate Deepgram sessions so track direction is preserved instead of mixing both tracks into one mono stream.
 - Deepgram diarization labels are preserved as `providerSpeakerLabel`; app-level speaker names include the Telnyx track, such as `telnyx_inbound_speaker_0`.
-- Interim and final transcript updates reuse the same transcript segment id when Deepgram reports the same track, speaker, and start time. This lets the UI replace interim text with final text later.
+- Interim Deepgram results are ignored for persistence and SSE. Only results with the normalized `isFinal` flag set are recorded to the transcript and forwarded to the suggestion engine.
 - Unit coverage uses mocked transcribers; live Deepgram validation against a real Telnyx call is still pending.
 - Local verification passed with `npm run typecheck`, `npm test`, `npm run format`, and `npm run build`.
 
-Follow-up TODO:
+Resolved follow-up:
 
-- [ ] Improve transcript reconciliation so an interim segment can be replaced by a nearby final segment from the same Telnyx track and Deepgram speaker even when Deepgram shifts the reported segment start time. Live test `8a9059c1-5e99-4d58-9d21-ce3aaaf851f7` left both interim `"Anyone"` and final `"Anyone there?"` because the start moved from `5050ms` to `5130ms`.
+- [x] Avoid duplicate interim/final transcript segments by not storing interim results. Live test `8a9059c1-5e99-4d58-9d21-ce3aaaf851f7` previously left both interim `"Anyone"` and final `"Anyone there?"` because Deepgram shifted the start time from `5050ms` to `5130ms`.
 
 ### Phase 6: Mixlayer Suggestions
 

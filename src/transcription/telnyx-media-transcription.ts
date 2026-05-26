@@ -165,7 +165,7 @@ export class TelnyxMediaTranscriptionSession {
     result: TranscriptionResult,
   ): Promise<void> {
     const text = result.text.trim();
-    if (!text || this.closed) {
+    if (!text || this.closed || !result.isFinal) {
       return;
     }
 
@@ -186,17 +186,15 @@ export class TelnyxMediaTranscriptionSession {
     await this.input.callStore.upsertTranscriptSegment(segment);
     this.input.eventBus.publishTranscript(segment);
 
-    if (segment.isFinal) {
-      void this.input.suggestionEngine
-        ?.handleTranscriptSegment(segment)
-        .catch((error: unknown) => {
-          console.error("Failed to handle transcript segment for suggestions", {
-            callId: this.input.callId,
-            segmentId: segment.id,
-            error,
-          });
+    void this.input.suggestionEngine
+      ?.handleTranscriptSegment(segment)
+      .catch((error: unknown) => {
+        console.error("Failed to handle transcript segment for suggestions", {
+          callId: this.input.callId,
+          segmentId: segment.id,
+          error,
         });
-    }
+      });
   }
 }
 

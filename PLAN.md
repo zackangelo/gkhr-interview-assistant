@@ -397,11 +397,22 @@ Follow-up TODO:
 
 ### Phase 6: Mixlayer Suggestions
 
-- Implement OpenAI-compatible chat completions wrapper.
-- Add prompt builder with context, transcript window, running summary, and previous suggestions.
-- Add cadence/rate limiting per call.
-- Store and broadcast suggestions.
-- Add tests around prompt construction and malformed model output handling.
+- [x] Implement OpenAI-compatible chat completions wrapper.
+- [x] Add prompt builder with context, transcript window, running summary, and previous suggestions.
+- [x] Add cadence/rate limiting per call.
+- [x] Store and broadcast suggestions.
+- [x] Add tests around prompt construction and malformed model output handling.
+
+Implementation notes:
+
+- The app now uses a small OpenAI-compatible chat completions wrapper for Mixlayer rather than the Modelsocket SDK.
+- The default base URL is `https://models.mixlayer.ai/v1`; the default prototype model is `qwen/qwen3.5-4b-free`.
+- Suggestions are triggered only from final transcript segments and are disabled unless `MIXLAYER_API_KEY` is configured.
+- The first substantive final segment can trigger suggestions immediately; later generations use per-call interval and accumulated-transcript thresholds.
+- The prompt includes the call context, recent diarized transcript, transcript delta since the previous suggestion request, running summary if available, and previous suggestions.
+- Model output is requested as JSON schema. Malformed JSON falls back to parsing plain-text lines as suggestions.
+- Duplicate suggestion text is filtered before storing and broadcasting.
+- Local verification passed with `npm run typecheck`, `npm test`, `npm run format`, and `npm run build`.
 
 ### Phase 7: Summary And Completion
 
@@ -688,10 +699,10 @@ Telnyx docs used:
 
 ## Immediate Next Step
 
-Live validation and Phase 6 preparation:
+Live validation and Phase 7 preparation:
 
-1. Place another Telnyx test call with `DEEPGRAM_API_KEY` configured and verify that `/calls/:call_id/stream` emits transcript events.
+1. Place another Telnyx test call with `DEEPGRAM_API_KEY` and `MIXLAYER_API_KEY` configured and verify that `/calls/:call_id/stream` emits both transcript and suggestion events.
 2. Inspect whether useful speech lands on `inbound`, `outbound`, or both tracks for the intended interview topology.
-3. Start Phase 6 by adding the Mixlayer chat completions client and suggestion cadence.
+3. Decide whether suggestion cadence should stay threshold-based or be tuned around interview-specific milestones.
 4. Decide the routing mechanism from inbound Telnyx webhook to pending internal call for multi-call or multi-participant scenarios: unique dial-in number, conference code, expected caller number, or provider metadata.
 5. Decide completed-call retention behavior for the in-memory prototype.

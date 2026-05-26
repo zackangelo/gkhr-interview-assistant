@@ -15,6 +15,7 @@ import type {
 } from "./domain/types.js";
 import type { CallEventBus } from "./events/call-event-bus.js";
 import { InMemoryCallEventBus } from "./events/call-event-bus.js";
+import type { SuggestionEngine } from "./suggestions/suggestion-engine.js";
 import { InMemoryCallStore } from "./store/in-memory-call-store.js";
 import type { TelnyxClient } from "./telnyx/client.js";
 import { HttpTelnyxClient } from "./telnyx/client.js";
@@ -335,6 +336,7 @@ export function registerMediaWebSocketRoute(
     callStore?: CallStore;
     eventBus?: CallEventBus;
     transcriber?: StreamingTranscriber | null;
+    suggestionEngine?: SuggestionEngine | null;
   },
 ): void {
   app.get(
@@ -351,6 +353,7 @@ export function registerMediaWebSocketRoute(
               callStore: input.callStore,
               eventBus: input.eventBus,
               transcriber: input.transcriber ?? null,
+              suggestionEngine: input.suggestionEngine ?? null,
             });
           }
 

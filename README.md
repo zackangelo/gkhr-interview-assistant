@@ -33,10 +33,22 @@ curl -N http://localhost:3000/calls/{call_id}/stream
 
 The stream emits ordered `transcript` and `suggestion` Server-Sent Events.
 Transcript events are published from Deepgram results when `DEEPGRAM_API_KEY`
-is set. Suggestion events will be added with the Mixlayer phase.
+is set. Suggestion events are published from Mixlayer chat completions when
+`MIXLAYER_API_KEY` is set.
 
 The app loads `.env` automatically when started through `src/index.ts` or the
 compiled `dist/index.js`.
+
+Optional Mixlayer settings:
+
+```sh
+MIXLAYER_API_KEY=...
+MIXLAYER_BASE_URL=https://models.mixlayer.ai/v1
+MIXLAYER_MODEL=qwen/qwen3.5-4b-free
+MIXLAYER_SUGGESTION_MIN_INTERVAL_MS=15000
+MIXLAYER_SUGGESTION_MIN_TRANSCRIPT_CHARS=120
+MIXLAYER_SUGGESTION_FIRST_SEGMENT_MIN_CHARS=40
+```
 
 ## Local Telnyx Webhook Testing With Tailscale Funnel
 

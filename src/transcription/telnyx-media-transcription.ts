@@ -1,8 +1,7 @@
-import { randomUUID } from "node:crypto";
-
 import type { CallStore } from "../domain/call-store.js";
 import type { TranscriptSegment } from "../domain/types.js";
 import type { CallEventBus } from "../events/call-event-bus.js";
+import type { SuggestionEngine } from "../suggestions/suggestion-engine.js";
 import type {
   StreamingTranscriber,
   TranscriptionAudioEncoding,
@@ -15,7 +14,7 @@ interface TelnyxMediaTranscriptionSessionInput {
   callStore: CallStore;
   eventBus: CallEventBus;
   transcriber: StreamingTranscriber | null;
-  createId?: () => string;
+  suggestionEngine?: SuggestionEngine | null;
   now?: () => Date;
 }
 
@@ -60,13 +59,11 @@ const defaultMediaFormat: MediaFormat = {
 
 export class TelnyxMediaTranscriptionSession {
   private readonly trackSessions = new Map<string, ActiveTrackSession>();
-  private readonly createId: () => string;
   private readonly now: () => Date;
   private mediaFormat: MediaFormat = defaultMediaFormat;
   private closed = false;
 
   constructor(private readonly input: TelnyxMediaTranscriptionSessionInput) {
-    this.createId = input.createId ?? randomUUID;
     this.now = input.now ?? (() => new Date());
   }
 
@@ -188,6 +185,18 @@ export class TelnyxMediaTranscriptionSession {
 
     await this.input.callStore.upsertTranscriptSegment(segment);
     this.input.eventBus.publishTranscript(segment);
+
+    if (segment.isFinal) {
+      void this.input.suggestionEngine
+        ?.handleTranscriptSegment(segment)
+        .catch((error: unknown) => {
+          console.error("Failed to handle transcript segment for suggestions", {
+            callId: this.input.callId,
+            segmentId: segment.id,
+            error,
+          });
+        });
+    }
   }
 }
 

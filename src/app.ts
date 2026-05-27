@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { logger } from "hono/logger";
 import { streamSSE } from "hono/streaming";
 import type { UpgradeWebSocket } from "hono/ws";
 import { randomUUID } from "node:crypto";
@@ -28,6 +29,7 @@ import {
 } from "./telnyx/webhooks.js";
 import { TelnyxMediaTranscriptionSession } from "./transcription/telnyx-media-transcription.js";
 import type { StreamingTranscriber } from "./transcription/transcriber.js";
+import { registerUiRoutes } from "./ui/routes.js";
 
 interface WebhookPing {
   id: string;
@@ -67,6 +69,9 @@ export function createApp(
     (config.telnyxApiKey ? new HttpTelnyxClient(config.telnyxApiKey) : null);
   const webhookPings: WebhookPing[] = [];
   const processedWebhookIds = new Set<string>();
+
+  app.use(logger());
+  registerUiRoutes(app);
 
   app.get("/", (c) => {
     return c.json({
@@ -271,6 +276,7 @@ export function createApp(
       const result = await handleTelnyxWebhookEvent({
         callStore,
         config,
+        eventBus,
         event,
         telnyxClient,
       });
@@ -415,6 +421,7 @@ export function registerMediaWebSocketRoute(
 async function handleTelnyxWebhookEvent(input: {
   callStore: CallStore;
   config: AppConfig;
+  eventBus: CallEventBus;
   event: TelnyxWebhookEvent;
   telnyxClient: TelnyxClient | null;
 }) {
@@ -449,6 +456,7 @@ async function handleTelnyxWebhookEvent(input: {
       callControlId,
       commandId: `answer:${input.event.data.id}`,
     });
+    input.eventBus.publishCallUpdate(updatedCall);
 
     return {
       action: "answer_sent",
@@ -468,13 +476,16 @@ async function handleTelnyxWebhookEvent(input: {
       return { action: "ignored", reason: "no_matching_call" };
     }
 
-    const activeCall = await input.callStore.updateCall(call.id, {
+    let activeCall = await input.callStore.updateCall(call.id, {
       providerCallLegs: upsertCallLeg(call, payload, "answered", {
         answeredAt: new Date(input.event.data.occurred_at ?? Date.now()),
       }),
       status: "active",
     });
     const telnyxClient = requireTelnyxClient(input.telnyxClient);
+    const conferenceAction = activeCall.providerConferenceId
+      ? "join_conference_sent"
+      : "create_conference_sent";
 
     if (activeCall.providerConferenceId) {
       await telnyxClient.joinConference({
@@ -490,7 +501,7 @@ async function handleTelnyxWebhookEvent(input: {
       });
 
       if (conference.conferenceId) {
-        await input.callStore.updateCall(activeCall.id, {
+        activeCall = await input.callStore.updateCall(activeCall.id, {
           providerConferenceId: conference.conferenceId,
         });
       }
@@ -504,11 +515,10 @@ async function handleTelnyxWebhookEvent(input: {
         commandId: `streaming-start:${input.event.data.id}`,
       });
     }
+    input.eventBus.publishCallUpdate(activeCall);
 
     return {
-      action: activeCall.providerConferenceId
-        ? "join_conference_sent"
-        : "create_conference_sent",
+      action: conferenceAction,
       callId: activeCall.id,
       callControlId,
       streamUrl,
@@ -530,11 +540,12 @@ async function handleTelnyxWebhookEvent(input: {
       return { action: "ignored", reason: "no_matching_call" };
     }
 
-    await input.callStore.updateCall(call.id, {
+    const updatedCall = await input.callStore.updateCall(call.id, {
       providerConferenceId: conferenceId,
       providerCallLegs: upsertCallLeg(call, payload, "joined"),
       status: "active",
     });
+    input.eventBus.publishCallUpdate(updatedCall);
 
     return {
       action: "conference_recorded",
@@ -554,13 +565,14 @@ async function handleTelnyxWebhookEvent(input: {
       return { action: "ignored", reason: "no_matching_call" };
     }
 
-    await input.callStore.updateCall(call.id, {
+    const updatedCall = await input.callStore.updateCall(call.id, {
       providerCallLegs: upsertCallLeg(call, payload, "completed", {
         endedAt: new Date(input.event.data.occurred_at ?? Date.now()),
       }),
       status: "completed",
       endedAt: new Date(input.event.data.occurred_at ?? Date.now()),
     });
+    input.eventBus.publishCallUpdate(updatedCall);
 
     return {
       action: "call_completed",

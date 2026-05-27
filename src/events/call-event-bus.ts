@@ -1,8 +1,41 @@
 import { randomUUID } from "node:crypto";
 
-import type { CallId, Suggestion, TranscriptSegment } from "../domain/types.js";
+import type {
+  Call,
+  CallId,
+  CallStatus,
+  Provider,
+  Suggestion,
+  TranscriptSegment,
+} from "../domain/types.js";
 
-export type CallStreamEvent = TranscriptStreamEvent | SuggestionStreamEvent;
+export type CallStreamEvent =
+  | TranscriptStreamEvent
+  | SuggestionStreamEvent
+  | CallUpdateStreamEvent;
+
+export interface CallUpdateStreamEvent {
+  id: string;
+  type: "call_update";
+  callId: CallId;
+  sequence: number;
+  occurredAt: string;
+  data: {
+    id: string;
+    provider: Provider;
+    providerCallId: string | null;
+    status: CallStatus;
+    dialInNumber: string;
+    conferenceName: string;
+    startedAt: string;
+    lastActivityAt: string;
+    providerCallLegId: string | null;
+    providerCallSessionId: string | null;
+    providerConferenceId: string | null;
+    providerSessionId: string | null;
+    endedAt: string | null;
+  };
+}
 
 export interface TranscriptStreamEvent {
   id: string;
@@ -47,6 +80,7 @@ export interface CallEventSubscription extends AsyncIterable<CallStreamEvent> {
 
 export interface CallEventBus {
   publish(event: CallStreamEvent): void;
+  publishCallUpdate(call: Call): CallStreamEvent;
   publishTranscript(segment: TranscriptSegment): CallStreamEvent;
   publishSuggestion(suggestion: Suggestion): CallStreamEvent;
   subscribe(callId: CallId): CallEventSubscription;
@@ -84,6 +118,34 @@ export class InMemoryCallEventBus implements CallEventBus {
       subscriber.queue.push(event);
       subscriber.notify();
     }
+  }
+
+  publishCallUpdate(call: Call): CallStreamEvent {
+    const event: CallUpdateStreamEvent = {
+      id: this.createId(),
+      type: "call_update",
+      callId: call.id,
+      sequence: this.nextSequence(call.id),
+      occurredAt: this.now().toISOString(),
+      data: {
+        id: call.id,
+        provider: call.provider,
+        providerCallId: call.providerCallId ?? null,
+        status: call.status,
+        dialInNumber: call.dialInNumber,
+        conferenceName: call.conferenceName,
+        startedAt: call.startedAt.toISOString(),
+        lastActivityAt: call.lastActivityAt.toISOString(),
+        providerCallLegId: call.providerCallLegId ?? null,
+        providerCallSessionId: call.providerCallSessionId ?? null,
+        providerConferenceId: call.providerConferenceId ?? null,
+        providerSessionId: call.providerSessionId ?? null,
+        endedAt: call.endedAt ? call.endedAt.toISOString() : null,
+      },
+    };
+
+    this.publish(event);
+    return event;
   }
 
   publishTranscript(segment: TranscriptSegment): CallStreamEvent {

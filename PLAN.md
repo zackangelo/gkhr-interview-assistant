@@ -423,11 +423,18 @@ Implementation notes:
 
 ### Phase 8: Web UI
 
-- Build a minimal UI that lists active calls.
-- Add call detail view with live transcript.
-- Render diarized transcript segments and inserted suggestions as one ordered timeline.
-- Show speaker uncertainty clearly.
-- Add reconnect behavior for stream interruptions.
+- [x] Build a minimal UI that lists active calls.
+- [x] Add call detail view with live transcript.
+- [x] Render diarized transcript segments and inserted suggestions as one ordered timeline.
+- [x] Show speaker uncertainty clearly through provider speaker labels and unknown-role display.
+- [x] Add reconnect behavior for stream interruptions through native `EventSource` retry.
+
+Implementation notes:
+
+- The UI is a React app built by Vite into `ui/dist` and served by the same Hono project at `/app`.
+- The UI consumes existing API endpoints without adding CORS setup or a second production server.
+- The string-based prototype UI assets were replaced by source files under `ui/src` and a bundled asset pipeline.
+- Local browser smoke checks passed against `/app` in Chrome at desktop and mobile viewport sizes.
 
 ### Phase 9: Production Hardening
 

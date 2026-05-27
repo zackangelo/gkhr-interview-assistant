@@ -75,6 +75,45 @@ describe("app", () => {
     });
   });
 
+  it("serves the bundled React UI shell", async () => {
+    const app = createApp(testConfig);
+
+    const response = await app.request("/app");
+    const body = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/html");
+    expect(body).toContain("GKHR Interview Assistant");
+    expect(body).toContain('<div id="root"></div>');
+    expect(body).toContain("/app/assets/");
+  });
+
+  it("serves UI assets from Hono", async () => {
+    const app = createApp(testConfig);
+    const indexResponse = await app.request("/app");
+    const indexBody = await indexResponse.text();
+    const stylePath = indexBody.match(/href="([^"]+\.css)"/)?.[1];
+    const scriptPath = indexBody.match(/src="([^"]+\.js)"/)?.[1];
+
+    const [styleResponse, scriptResponse] = await Promise.all([
+      app.request(stylePath ?? "/missing.css"),
+      app.request(scriptPath ?? "/missing.js"),
+    ]);
+    const [styles, script] = await Promise.all([
+      styleResponse.text(),
+      scriptResponse.text(),
+    ]);
+
+    expect(stylePath).toMatch(/^\/app\/assets\/.+\.css$/);
+    expect(scriptPath).toMatch(/^\/app\/assets\/.+\.js$/);
+    expect(styleResponse.status).toBe(200);
+    expect(styleResponse.headers.get("content-type")).toContain("text/css");
+    expect(styles).toContain(".workspace");
+    expect(scriptResponse.status).toBe(200);
+    expect(scriptResponse.headers.get("content-type")).toContain("javascript");
+    expect(script.length).toBeGreaterThan(1000);
+  });
+
   it("records Telnyx webhook pings", async () => {
     const app = createApp(testConfig);
 
@@ -260,6 +299,60 @@ describe("app", () => {
     expect(frame).toContain("id: event_123");
     expect(frame).toContain('"segmentId":"seg_123"');
     expect(frame).toContain('"sequence":1');
+  });
+
+  it("streams Telnyx webhook call state updates over SSE", async () => {
+    const eventBus = new InMemoryCallEventBus({
+      createId: () => "event_call_update_123",
+      now: () => new Date("2026-05-19T12:00:00.000Z"),
+    });
+    const telnyxClient = new FakeTelnyxClient();
+    const app = createApp(testConfig, { eventBus, telnyxClient });
+
+    const createResponse = await app.request("/calls", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        contextPrompt: "Candidate: Jane Candidate",
+      }),
+    });
+    const createBody = await createResponse.json();
+    const streamResponse = await app.request(
+      `/calls/${createBody.call.id}/stream`,
+    );
+    const reader = streamResponse.body?.getReader();
+    expect(reader).toBeDefined();
+
+    await app.request("/answerCall", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        data: {
+          event_type: "call.initiated",
+          id: "event_initiated_123",
+          payload: {
+            call_control_id: "v3:test-call",
+            call_leg_id: "leg_123",
+            call_session_id: "session_123",
+            to: "+15122548727",
+          },
+        },
+      }),
+    });
+
+    const chunk = await reader?.read();
+    await reader?.cancel();
+    const frame = new TextDecoder().decode(chunk?.value);
+
+    expect(streamResponse.status).toBe(200);
+    expect(frame).toContain("event: call_update");
+    expect(frame).toContain("id: event_call_update_123");
+    expect(frame).toContain('"status":"ringing"');
+    expect(frame).toContain('"providerCallId":"v3:test-call"');
   });
 
   it("returns 404 for unknown call streams", async () => {

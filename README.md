@@ -11,6 +11,26 @@ npm run dev
 
 The server listens on `http://localhost:3000` by default.
 
+The same Hono server hosts the browser UI at:
+
+```text
+http://localhost:3000/app
+```
+
+The UI is a React app built by Vite and served by Hono from `ui/dist`.
+Build it before starting the Hono server if the bundle is missing or stale:
+
+```sh
+npm run build:ui
+```
+
+For UI-only development, Vite can run separately and proxy API requests to the
+Hono server:
+
+```sh
+npm run dev:ui
+```
+
 Set `TELNYX_DIAL_IN_NUMBER` before using `POST /calls`:
 
 ```sh
